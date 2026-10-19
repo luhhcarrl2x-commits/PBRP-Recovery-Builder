@@ -32,9 +32,14 @@ on:
         required: true
         default: 'PLACEHOLDER'
       BUILD_TARGET:
-        description: 'BUILD_TARGET'
+        description: 'BUILD_TARGET (partition the recovery is built into)'
         required: true
-        default: 'PLACEHOLDER'
+        type: choice
+        default: 'recovery'
+        options:
+          - recovery
+          - boot
+          - vendor_boot
       USER_NAME:
         description: 'Git Username'
         required: true
@@ -61,8 +66,27 @@ jobs:
         echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
         echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
-        echo "Build Target: ${{ github.event.inputs.BUILD_TARGET }}.img"
+        echo "Build Target: ${{ steps.target.outputs.img_name }}"
         echo "::endgroup::"
+
+    - name: Resolve build target
+      id: target
+      env:
+        BUILD_TARGET: ${{ github.event.inputs.BUILD_TARGET }}
+      run: |
+        # Strip accidental suffixes like "image" or ".img"
+        TARGET="${BUILD_TARGET%.img}"
+        TARGET="${TARGET%image}"
+        case "$TARGET" in
+          recovery)    MAKE_TARGET=recoveryimage ;;
+          boot)        MAKE_TARGET=bootimage ;;
+          vendor_boot) MAKE_TARGET=vendorbootimage ;;
+          *) echo "::error::Unsupported BUILD_TARGET '$BUILD_TARGET' (use recovery, boot or vendor_boot)"; exit 1 ;;
+        esac
+        echo "make_target=$MAKE_TARGET" >> "$GITHUB_OUTPUT"
+        echo "img_name=$TARGET.img" >> "$GITHUB_OUTPUT"
+        echo "Make target: $MAKE_TARGET"
+        echo "Output image: $TARGET.img"
 
     - name: Check Out
       uses: actions/checkout@v4
@@ -124,14 +148,15 @@ jobs:
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ github.event.inputs.BUILD_TARGET }}image -j$(nproc --all)
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ steps.target.outputs.make_target }} -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: Upload to Release
       uses: softprops/action-gh-release@v1
       with:
-        files: | 
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
+        fail_on_unmatched_files: false
+        files: |
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ steps.target.outputs.img_name }}
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
@@ -139,7 +164,7 @@ jobs:
         body: |
           Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ github.event.inputs.BUILD_TARGET }}.img
+          Target: ${{ steps.target.outputs.img_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         
