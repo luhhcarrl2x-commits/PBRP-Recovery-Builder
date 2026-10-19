@@ -32,11 +32,12 @@ on:
         required: true
         default: 'PLACEHOLDER'
       BUILD_TARGET:
-        description: 'BUILD_TARGET (partition the recovery is built into)'
+        description: 'BUILD_TARGET (pbrp = let PBRP pick the right image from the device tree and make the flashable zip)'
         required: true
         type: choice
-        default: 'recovery'
+        default: 'pbrp'
         options:
+          - pbrp
           - recovery
           - boot
           - vendor_boot
@@ -52,10 +53,29 @@ on:
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest switches to 26.04 in Nov 2026, which is untested with the Android 12.1 tree
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+    - name: Resolve build target
+      id: target
+      env:
+        BUILD_TARGET: ${{ github.event.inputs.BUILD_TARGET }}
+      run: |
+        # Strip accidental suffixes like "image" or ".img"
+        TARGET="${BUILD_TARGET%.img}"
+        TARGET="${TARGET%image}"
+        case "$TARGET" in
+          pbrp)        MAKE_TARGET=pbrp ;;
+          recovery)    MAKE_TARGET=recoveryimage ;;
+          boot)        MAKE_TARGET=bootimage ;;
+          vendor_boot) MAKE_TARGET=vendorbootimage ;;
+          *) echo "::error::Unsupported BUILD_TARGET '$BUILD_TARGET' (use pbrp, recovery, boot or vendor_boot)"; exit 1 ;;
+        esac
+        echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+        echo "make_target=$MAKE_TARGET" >> "$GITHUB_OUTPUT"
+
     - name: Display Run Parameters
       run: |
         echo "::group::User Environment Variables"
@@ -66,27 +86,8 @@ jobs:
         echo "Device Path: ${{ github.event.inputs.DEVICE_PATH }}"
         echo "Device Name: ${{ github.event.inputs.DEVICE_NAME }}"
         echo "Makefile Name: ${{ github.event.inputs.MAKEFILE_NAME }}"
-        echo "Build Target: ${{ steps.target.outputs.img_name }}"
+        echo "Build Target: ${{ steps.target.outputs.target }} (make ${{ steps.target.outputs.make_target }})"
         echo "::endgroup::"
-
-    - name: Resolve build target
-      id: target
-      env:
-        BUILD_TARGET: ${{ github.event.inputs.BUILD_TARGET }}
-      run: |
-        # Strip accidental suffixes like "image" or ".img"
-        TARGET="${BUILD_TARGET%.img}"
-        TARGET="${TARGET%image}"
-        case "$TARGET" in
-          recovery)    MAKE_TARGET=recoveryimage ;;
-          boot)        MAKE_TARGET=bootimage ;;
-          vendor_boot) MAKE_TARGET=vendorbootimage ;;
-          *) echo "::error::Unsupported BUILD_TARGET '$BUILD_TARGET' (use recovery, boot or vendor_boot)"; exit 1 ;;
-        esac
-        echo "make_target=$MAKE_TARGET" >> "$GITHUB_OUTPUT"
-        echo "img_name=$TARGET.img" >> "$GITHUB_OUTPUT"
-        echo "Make target: $MAKE_TARGET"
-        echo "Output image: $TARGET.img"
 
     - name: Check Out
       uses: actions/checkout@v4
@@ -96,10 +97,11 @@ jobs:
 
     - name: Prepare the environment
       run: |
+        sudo apt update
         sudo apt install git aria2 -y
         mkdir ofx_scripts
         cd ofx_scripts
-        git clone https://gitlab.com/OrangeFox/misc/scripts 
+        git clone https://gitlab.com/OrangeFox/misc/scripts
         cd scripts
         sudo bash setup/android_build_env.sh
         sed -i 's/cd -/cd ../g' setup/install_android_sdk.sh
@@ -107,19 +109,20 @@ jobs:
 
     - name: Setup SSH Keys
       if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@github.com') }}
-      uses: webfactory/ssh-agent@v0.5.4
+      uses: webfactory/ssh-agent@v0.9.1
       with:
           ssh-private-key: |
               ${{ secrets.SSH_PRIVATE_KEY }}
 
     - name: Install repo
       run: |
-        mkdir ~/bin
+        mkdir -p ~/bin
         curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
-      
+
     - name: Initialize repo
+      id: pwd
       run: |
         mkdir workspace
         cd workspace
@@ -127,13 +130,12 @@ jobs:
         git config --global user.name "${{ github.event.inputs.USER_NAME }}"
         git config --global user.email "${{ github.event.inputs.USER_EMAIL }}"
         repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
-      id: pwd
-          
+
     - name: Repo Sync
       run: |
         repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune --force-sync -j$(nproc --all)
       working-directory: workspace
-      
+
     - name: Clone device tree
       run: |
         git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
@@ -148,23 +150,45 @@ jobs:
       run: |
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng && make clean && make ${{ steps.target.outputs.make_target }} -j$(nproc --all)
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        make ${{ steps.target.outputs.make_target }} -j$(nproc --all)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
+    - name: Collect build output
+      env:
+        OUT_DIR: workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}
+        TARGET: ${{ steps.target.outputs.target }}
+      run: |
+        if [ ! -d "$OUT_DIR" ]; then
+          echo "::error::$OUT_DIR not found - check that DEVICE_NAME matches PRODUCT_DEVICE in the device tree"
+          exit 1
+        fi
+        mkdir -p upload
+        if [ "$TARGET" = "pbrp" ]; then
+          IMAGES="recovery.img boot.img vendor_boot.img"
+        else
+          IMAGES="$TARGET.img"
+        fi
+        for f in $IMAGES; do
+          [ -f "$OUT_DIR/$f" ] && cp -v "$OUT_DIR/$f" upload/
+        done
+        cp -v "$OUT_DIR"/PBRP-*.zip upload/ 2>/dev/null || true
+        if [ -z "$(ls -A upload)" ]; then
+          echo "::error::No recovery image or PBRP zip was produced in $OUT_DIR"
+          ls -la "$OUT_DIR"
+          exit 1
+        fi
+        ls -la upload
+
     - name: Upload to Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
-        fail_on_unmatched_files: false
-        files: |
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ steps.target.outputs.img_name }}
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
+        files: upload/*
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
           Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
           Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ steps.target.outputs.img_name }}
+          Target: ${{ steps.target.outputs.target }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        
